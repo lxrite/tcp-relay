@@ -1,7 +1,7 @@
 # TCP-Relay
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-A high-performance and easy-to-use TCP-Relay write in C++20 based on [AISO](https://think-async.com/Asio/) and [Coroutines](https://en.cppreference.com/w/cpp/language/coroutines). In addition to basic TCP relay, it also supports relaying through intermediate proxies (such as HTTP-Proxy).
+A high-performance and easy-to-use TCP-Relay write in C++20 based on [ASIO](https://think-async.com/Asio/) and [Coroutines](https://en.cppreference.com/w/cpp/language/coroutines). In addition to basic TCP relay, it also supports relaying through intermediate proxies (such as HTTP-Proxy).
 
 # Getting Started
 ## Build from source
