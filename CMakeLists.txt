@@ -36,3 +36,5 @@ add_executable(tcp-relay src/tcp_relay.cpp)
 if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
   target_compile_options(tcp-relay PRIVATE -fcoroutines)
 endif()
+
+install(TARGETS tcp-relay DESTINATION bin)
