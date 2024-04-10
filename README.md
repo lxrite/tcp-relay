@@ -54,11 +54,9 @@ options:
 
 ## Using Docker
 ``` bash
-# build from local Dockerfile
-docker build -t lxrite/tcp-relay .
-# build from URL
-docker build -t lxrite/tcp-relay https://github.com/lxrite/tcp-relay.git
+# pull image
+docker pull ghcr.io/lxrite/tcp-relay:latest
 
 # run
-docker run -d -p 8886:8886 lxrite/tcp-relay tcp-relay -t 172.16.1.1:8080
+docker run -d -p 8886:8886 ghcr.io/lxrite/tcp-relay tcp-relay -t 172.16.1.1:8080
 ```
