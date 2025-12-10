@@ -35,7 +35,13 @@ options:
   --via [none | http_proxy]   Transfer via other proxy (default: none)
   --http_proxy string         HTTP-Proxy address (host:port)
   --log_level string [trace | debug | info | warn | error | disable] Log level (default: info)
+  --threads number            Number of worker threads (default: 4)
 ```
+
+## Changelog
+
+### 1.0.1
+- Added multi-threading support with configurable worker threads via `--threads` option (default: 4 threads)
 
 ## Examples
 ``` bash

@@ -39,7 +39,7 @@ using fmt::format_string;
 using namespace asio::experimental::awaitable_operators;
 using AddressType = std::pair<std::string, asio::ip::port_type>;
 
-constexpr char kAppVersionString[] = "1.0.0";
+constexpr char kAppVersionString[] = "1.0.1";
 
 constexpr std::uint32_t kResolveTimeout = 20;
 constexpr std::uint32_t kConnectTimeout = 20;
