@@ -15,8 +15,10 @@
 #include <asio/steady_timer.hpp>
 #include <chrono>
 #include <iostream>
+#include <mutex>
 #include <regex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef USE_STD_FORMAT
@@ -133,7 +135,13 @@ private:
     }
     std::string level_str = log_level_name(level);
     std::string message = stdx::format(fmt, std::forward<Args>(args)...);
+#ifdef USE_STD_FORMAT
+    auto time = std::chrono::zoned_time{std::chrono::current_zone(),
+                                        std::chrono::system_clock::now()};
+#else
     auto time = std::chrono::system_clock::now();
+#endif
+    std::lock_guard<std::mutex> lock(s_log_mutex);
     std::cout << stdx::format("[{}] {:%F %T %Z} | {}\n", level_str, time,
                               message);
   }
@@ -157,9 +165,11 @@ private:
   }
 
   static LogLevel s_log_level;
+  static std::mutex s_log_mutex;
 };
 
 LogLevel Log::s_log_level = LogLevel::info;
+std::mutex Log::s_log_mutex;
 
 enum class TransferType {
   uplink,
@@ -490,6 +500,7 @@ struct Args {
   ViaType via_type = ViaType::none;
   AddressType http_proxy_address = {"", 0};
   LogLevel log_level = LogLevel::info;
+  std::uint32_t num_threads = 4;
 
   static void print_usage() {
 #ifdef _WIN32
@@ -516,7 +527,9 @@ struct Args {
            "none)\n"
         << "  --http_proxy string         HTTP-Proxy address (host:port)\n"
         << "  --log_level string [trace | debug | info | warn | error | "
-           "disable] Log level (default: info)\n";
+           "disable] Log level (default: info)\n"
+        << "  --threads number            Number of worker threads (default: "
+        << args.num_threads << ")\n";
   }
 
   static asio::ip::port_type parse_port(const std::string &port) {
@@ -649,6 +662,19 @@ struct Args {
           invalid_param = true;
           break;
         }
+      } else if (arg == "--threads") {
+        if (++i >= argv.size()) {
+          invalid_param = true;
+          break;
+        }
+        try {
+          args.num_threads = std::stoul(argv[i]);
+          if (args.num_threads == 0) {
+            invalid_param = true;
+          }
+        } catch (std::exception &) {
+          invalid_param = true;
+        }
       } else {
         std::cerr << "Unknown argument: " << arg << std::endl;
         print_usage();
@@ -704,6 +730,7 @@ struct Args {
                 << ":" << std::get<1>(args.http_proxy_address) << "\n";
     }
     std::cout << "Connection timeout: " << args.timeout << "\n";
+    std::cout << "Worker threads: " << args.num_threads << "\n";
   }
 };
 
@@ -712,7 +739,7 @@ int main(int argc, char **argv) {
   Args::print_args(args);
   Log::set_log_level(args.log_level);
   try {
-    asio::io_context io_context(1);
+    asio::io_context io_context(args.num_threads);
     asio::signal_set signals(io_context, SIGINT, SIGTERM);
     signals.async_wait([&](auto, auto) { io_context.stop(); });
     asio::co_spawn(
@@ -730,7 +757,15 @@ int main(int argc, char **argv) {
           co_await server.listen();
         },
         asio::detached);
+    std::vector<std::thread> threads;
+    threads.reserve(args.num_threads - 1);
+    for (std::uint32_t i = 1; i < args.num_threads; ++i) {
+      threads.emplace_back([&io_context]() { io_context.run(); });
+    }
     io_context.run();
+    for (auto &t : threads) {
+      t.join();
+    }
   } catch (std::exception &e) {
     std::printf("Exception: %s\n", e.what());
   }
