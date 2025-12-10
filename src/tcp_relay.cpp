@@ -20,21 +20,7 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-#ifdef USE_STD_FORMAT
 #include <format>
-namespace stdx {
-using std::format;
-using std::format_string;
-} // namespace stdx
-#else
-#include <fmt/chrono.h>
-#include <fmt/format.h>
-namespace stdx {
-using fmt::format;
-using fmt::format_string;
-} // namespace stdx
-#endif
 
 using namespace asio::experimental::awaitable_operators;
 using AddressType = std::pair<std::string, asio::ip::port_type>;
@@ -105,22 +91,22 @@ enum class LogLevel {
 class Log {
 public:
   template <typename... Args>
-  static void trace(stdx::format_string<Args...> fmt, Args &&...args) {
+  static void trace(std::format_string<Args...> fmt, Args &&...args) {
     log(LogLevel::trace, fmt, std::forward<Args>(args)...);
   }
 
   template <typename... Args>
-  static void debug(stdx::format_string<Args...> fmt, Args &&...args) {
+  static void debug(std::format_string<Args...> fmt, Args &&...args) {
     log(LogLevel::debug, fmt, std::forward<Args>(args)...);
   }
 
   template <typename... Args>
-  static void info(stdx::format_string<Args...> fmt, Args &&...args) {
+  static void info(std::format_string<Args...> fmt, Args &&...args) {
     log(LogLevel::info, fmt, std::forward<Args>(args)...);
   }
 
   template <typename... Args>
-  static void error(stdx::format_string<Args...> fmt, Args &&...args) {
+  static void error(std::format_string<Args...> fmt, Args &&...args) {
     log(LogLevel::error, fmt, std::forward<Args>(args)...);
   }
 
@@ -128,22 +114,18 @@ public:
 
 private:
   template <typename... Args>
-  static void log(LogLevel level, stdx::format_string<Args...> fmt,
+  static void log(LogLevel level, std::format_string<Args...> fmt,
                   Args &&...args) {
     if (level < s_log_level) {
       return;
     }
     std::string level_str = log_level_name(level);
-    std::string message = stdx::format(fmt, std::forward<Args>(args)...);
-#ifdef USE_STD_FORMAT
+    std::string message = std::format(fmt, std::forward<Args>(args)...);
     auto time = std::chrono::zoned_time{std::chrono::current_zone(),
                                         std::chrono::system_clock::now()};
-#else
-    auto time = std::chrono::system_clock::now();
-#endif
     std::lock_guard<std::mutex> lock(s_log_mutex);
-    std::cout << stdx::format("[{}] {:%F %T %Z} | {}\n", level_str, time,
-                              message);
+    std::cout << std::format("[{}] {:%F %T %Z} | {}\n", level_str, time,
+                             message);
   }
 
   static std::string log_level_name(LogLevel level) {
@@ -261,25 +243,25 @@ private:
     Log::error("[session: {}] | failed to connect to {}:{}", session_id_, host,
                port);
     throw std::runtime_error(
-        stdx::format("failed to connect to {}:{}", session_id_, host, port));
+        std::format("failed to connect to {}:{}", session_id_, host, port));
   }
 
   asio::awaitable<void> http_proxy_handshake(asio::ip::tcp::socket &server) {
     const auto &target_address = options_.target_address;
     std::string http_host;
     if (std::get<0>(target_address).find(':') != std::string::npos) {
-      http_host = stdx::format("[{}]:{}", std::get<0>(target_address),
-                               std::get<1>(target_address));
+      http_host = std::format("[{}]:{}", std::get<0>(target_address),
+                              std::get<1>(target_address));
     } else {
-      http_host = stdx::format("{}:{}", std::get<0>(target_address),
-                               std::get<1>(target_address));
+      http_host = std::format("{}:{}", std::get<0>(target_address),
+                              std::get<1>(target_address));
     }
     Log::debug("[session: {}] | http-proxy handshake CONNECT {} HTTP/1.1",
                session_id_, http_host);
     std::string request_header =
-        stdx::format("CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Connection: "
-                     "keep-alive\r\n\r\n",
-                     http_host, http_host);
+        std::format("CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Connection: "
+                    "keep-alive\r\n\r\n",
+                    http_host, http_host);
     std::size_t request_header_size = request_header.size();
     std::size_t bytes_written = 0;
     auto executor = co_await asio::this_coro::executor;
@@ -427,9 +409,9 @@ private:
   std::string endpoint_to_string(const asio::ip::tcp::endpoint &endpoint) {
     auto address = endpoint.address();
     if (address.is_v6()) {
-      return stdx::format("[{}]:{}", address.to_string(), endpoint.port());
+      return std::format("[{}]:{}", address.to_string(), endpoint.port());
     } else {
-      return stdx::format("{}:{}", address.to_string(), endpoint.port());
+      return std::format("{}:{}", address.to_string(), endpoint.port());
     }
   }
 
