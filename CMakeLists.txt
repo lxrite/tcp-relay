@@ -28,3 +28,16 @@ if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
 endif()
 
 install(TARGETS tcp-relay DESTINATION bin)
+
+# Benchmark tools (optional)
+option(BUILD_BENCHMARK "Build benchmark tools" OFF)
+
+if(BUILD_BENCHMARK)
+  add_executable(echo-server benchmark/echo_server.cpp)
+  add_executable(benchmark-client benchmark/benchmark_client.cpp)
+
+  if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
+    target_compile_options(echo-server PRIVATE -fcoroutines)
+    target_compile_options(benchmark-client PRIVATE -fcoroutines)
+  endif()
+endif()
