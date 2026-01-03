@@ -14,18 +14,25 @@
 #include <asio/signal_set.hpp>
 #include <asio/steady_timer.hpp>
 #include <chrono>
+#include <cstring>
+#include <format>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <regex>
 #include <string>
 #include <thread>
 #include <vector>
-#include <format>
+
+#include <mbedtls/aes.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/md.h>
 
 using namespace asio::experimental::awaitable_operators;
 using AddressType = std::pair<std::string, asio::ip::port_type>;
 
-constexpr char kAppVersionString[] = "1.0.1";
+constexpr char kAppVersionString[] = "1.1.0";
 
 constexpr std::uint32_t kResolveTimeout = 20;
 constexpr std::uint32_t kConnectTimeout = 20;
@@ -34,6 +41,140 @@ constexpr std::uint32_t kHttpProxyHandshakeTimeout = 20;
 enum class ViaType {
   none,
   http_proxy,
+};
+
+enum class RelayMode {
+  relay,  // Passthrough mode (default)
+  client, // Client mode (encrypt uplink, decrypt downlink)
+  server, // Server mode (decrypt uplink, encrypt downlink)
+};
+
+// Stream cipher class for AES-256-CFB encryption/decryption
+class StreamCipher {
+public:
+  static constexpr std::size_t kIvSize = 16;
+  static constexpr std::size_t kKeySize = 32; // AES-256
+
+  StreamCipher(const std::string &key) {
+    key_.resize(kKeySize);
+    derive_key(key);
+    mbedtls_aes_init(&encrypt_ctx_);
+    mbedtls_aes_init(&decrypt_ctx_);
+    mbedtls_entropy_init(&entropy_);
+    mbedtls_ctr_drbg_init(&ctr_drbg_);
+    const char *pers = "tcp_relay_cipher";
+    mbedtls_ctr_drbg_seed(&ctr_drbg_, mbedtls_entropy_func, &entropy_,
+                          reinterpret_cast<const unsigned char *>(pers),
+                          std::strlen(pers));
+  }
+
+  ~StreamCipher() {
+    mbedtls_aes_free(&encrypt_ctx_);
+    mbedtls_aes_free(&decrypt_ctx_);
+    mbedtls_ctr_drbg_free(&ctr_drbg_);
+    mbedtls_entropy_free(&entropy_);
+  }
+
+  StreamCipher(const StreamCipher &) = delete;
+  StreamCipher &operator=(const StreamCipher &) = delete;
+
+  // Generate random IV, prepend to output, then encrypt data
+  std::vector<char> encrypt_first_packet(const char *data, std::size_t len) {
+    // Generate random IV
+    mbedtls_ctr_drbg_random(&ctr_drbg_, encrypt_iv_, kIvSize);
+    encrypt_iv_offset_ = 0;
+
+    // Setup encryption key
+    mbedtls_aes_setkey_enc(&encrypt_ctx_, key_.data(), kKeySize * 8);
+    encrypt_initialized_ = true;
+
+    // Output = IV + encrypted data
+    std::vector<char> output(kIvSize + len);
+    std::memcpy(output.data(), encrypt_iv_, kIvSize);
+
+    // Encrypt data
+    mbedtls_aes_crypt_cfb128(
+        &encrypt_ctx_, MBEDTLS_AES_ENCRYPT, len, &encrypt_iv_offset_,
+        encrypt_iv_, reinterpret_cast<const unsigned char *>(data),
+        reinterpret_cast<unsigned char *>(output.data() + kIvSize));
+    return output;
+  }
+
+  // Extract IV from first packet and decrypt remaining data
+  std::vector<char> decrypt_first_packet(const char *data, std::size_t len) {
+    if (len < kIvSize) {
+      throw std::runtime_error("First packet too short to contain IV");
+    }
+
+    // Extract IV
+    std::memcpy(decrypt_iv_, data, kIvSize);
+    decrypt_iv_offset_ = 0;
+
+    // Setup decryption key (CFB mode uses encryption key for both)
+    mbedtls_aes_setkey_enc(&decrypt_ctx_, key_.data(), kKeySize * 8);
+    decrypt_initialized_ = true;
+
+    // Decrypt remaining data
+    std::size_t cipher_len = len - kIvSize;
+    std::vector<char> output(cipher_len);
+
+    if (cipher_len > 0) {
+      mbedtls_aes_crypt_cfb128(
+          &decrypt_ctx_, MBEDTLS_AES_DECRYPT, cipher_len, &decrypt_iv_offset_,
+          decrypt_iv_, reinterpret_cast<const unsigned char *>(data + kIvSize),
+          reinterpret_cast<unsigned char *>(output.data()));
+    }
+    return output;
+  }
+
+  // Encrypt subsequent packets (stream mode)
+  void encrypt(const char *input, char *output, std::size_t len) {
+    if (!encrypt_initialized_) {
+      throw std::runtime_error("Encryption not initialized");
+    }
+    mbedtls_aes_crypt_cfb128(&encrypt_ctx_, MBEDTLS_AES_ENCRYPT, len,
+                             &encrypt_iv_offset_, encrypt_iv_,
+                             reinterpret_cast<const unsigned char *>(input),
+                             reinterpret_cast<unsigned char *>(output));
+  }
+
+  // Decrypt subsequent packets (stream mode)
+  void decrypt(const char *input, char *output, std::size_t len) {
+    if (!decrypt_initialized_) {
+      throw std::runtime_error("Decryption not initialized");
+    }
+    mbedtls_aes_crypt_cfb128(&decrypt_ctx_, MBEDTLS_AES_DECRYPT, len,
+                             &decrypt_iv_offset_, decrypt_iv_,
+                             reinterpret_cast<const unsigned char *>(input),
+                             reinterpret_cast<unsigned char *>(output));
+  }
+
+  bool is_encrypt_initialized() const { return encrypt_initialized_; }
+  bool is_decrypt_initialized() const { return decrypt_initialized_; }
+
+private:
+  // Key derivation using SHA256
+  void derive_key(const std::string &password) {
+    const mbedtls_md_info_t *md_info =
+        mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    mbedtls_md(md_info,
+               reinterpret_cast<const unsigned char *>(password.data()),
+               password.size(), key_.data());
+  }
+
+  std::vector<unsigned char> key_;
+
+  mbedtls_aes_context encrypt_ctx_;
+  mbedtls_aes_context decrypt_ctx_;
+  mbedtls_entropy_context entropy_;
+  mbedtls_ctr_drbg_context ctr_drbg_;
+
+  unsigned char encrypt_iv_[kIvSize] = {0};
+  unsigned char decrypt_iv_[kIvSize] = {0};
+  std::size_t encrypt_iv_offset_ = 0;
+  std::size_t decrypt_iv_offset_ = 0;
+  bool encrypt_initialized_ = false;
+  bool decrypt_initialized_ = false;
 };
 
 class Watchdog {
@@ -163,13 +304,19 @@ struct RelayConnectionOptions {
   std::uint32_t timeout;
   ViaType via_type;
   AddressType http_proxy_address;
+  RelayMode relay_mode;
+  std::string cipher_key;
 };
 
 class RelayConnection {
 public:
   RelayConnection(std::uint64_t session_id,
                   const RelayConnectionOptions &options)
-      : session_id_(session_id), options_(options) {}
+      : session_id_(session_id), options_(options) {
+    if (options_.relay_mode != RelayMode::relay) {
+      cipher_ = std::make_unique<StreamCipher>(options_.cipher_key);
+    }
+  }
 
   asio::awaitable<void> relay(asio::ip::tcp::socket client) {
     Log::info("[session: {}] | start connection from {}", session_id_,
@@ -331,7 +478,8 @@ private:
   asio::awaitable<void> tunnel_transfer(asio::ip::tcp::socket &client,
                                         asio::ip::tcp::socket &server) {
     Deadline deadline;
-    Log::debug("[session: {}] | start tunnel transfer", session_id_);
+    Log::debug("[session: {}] | start tunnel transfer (mode: {})", session_id_,
+               relay_mode_to_string(options_.relay_mode));
     auto transfer_result =
         co_await (tunnel_transfer(client, server, deadline) ||
                   tunnel_transfer_timeout(deadline));
@@ -353,11 +501,40 @@ private:
     }
   }
 
+  // Determine if encryption should be applied for this transfer direction
+  bool should_encrypt(TransferType type) const {
+    if (options_.relay_mode == RelayMode::relay) {
+      return false;
+    }
+    // Client mode: encrypt uplink (client->server)
+    // Server mode: encrypt downlink (server->client)
+    return (options_.relay_mode == RelayMode::client &&
+            type == TransferType::uplink) ||
+           (options_.relay_mode == RelayMode::server &&
+            type == TransferType::downlink);
+  }
+
+  // Determine if decryption should be applied for this transfer direction
+  bool should_decrypt(TransferType type) const {
+    if (options_.relay_mode == RelayMode::relay) {
+      return false;
+    }
+    // Client mode: decrypt downlink (server->client)
+    // Server mode: decrypt uplink (client->server)
+    return (options_.relay_mode == RelayMode::client &&
+            type == TransferType::downlink) ||
+           (options_.relay_mode == RelayMode::server &&
+            type == TransferType::uplink);
+  }
+
   asio::awaitable<void> transfer(TransferType type, asio::ip::tcp::socket &from,
                                  asio::ip::tcp::socket &to,
                                  Deadline &deadline) {
     std::array<char, 4096> buffer;
+    std::array<char, 4096 + StreamCipher::kIvSize> output_buffer;
     std::string transfer_type_string = transfer_type_to_string(type);
+    bool first_packet = true;
+
     for (;;) {
       deadline.expires_after(std::chrono::seconds(options_.timeout));
       auto [read_error, bytes_read] = co_await from.async_read_some(
@@ -372,12 +549,52 @@ private:
                    transfer_type_string, read_error.message());
         throw std::system_error(read_error);
       }
+
+      const char *write_data = buffer.data();
+      std::size_t write_len = bytes_read;
+      std::vector<char> temp_buffer;
+
+      // Apply encryption if needed
+      if (should_encrypt(type) && cipher_) {
+        if (first_packet) {
+          temp_buffer =
+              cipher_->encrypt_first_packet(buffer.data(), bytes_read);
+          write_data = temp_buffer.data();
+          write_len = temp_buffer.size();
+          first_packet = false;
+          Log::trace("[session: {}] | {} first packet encrypted with IV ({} -> "
+                     "{} bytes)",
+                     session_id_, transfer_type_string, bytes_read, write_len);
+        } else {
+          cipher_->encrypt(buffer.data(), output_buffer.data(), bytes_read);
+          write_data = output_buffer.data();
+          write_len = bytes_read;
+        }
+      }
+      // Apply decryption if needed
+      else if (should_decrypt(type) && cipher_) {
+        if (first_packet) {
+          temp_buffer =
+              cipher_->decrypt_first_packet(buffer.data(), bytes_read);
+          write_data = temp_buffer.data();
+          write_len = temp_buffer.size();
+          first_packet = false;
+          Log::trace("[session: {}] | {} first packet decrypted with IV ({} -> "
+                     "{} bytes)",
+                     session_id_, transfer_type_string, bytes_read, write_len);
+        } else {
+          cipher_->decrypt(buffer.data(), output_buffer.data(), bytes_read);
+          write_data = output_buffer.data();
+          write_len = bytes_read;
+        }
+      }
+
+      // Write data
       std::size_t bytes_written = 0;
-      while (bytes_written < bytes_read) {
+      while (bytes_written < write_len) {
         deadline.expires_after(std::chrono::seconds(options_.timeout));
         auto [write_error, bytes_transferred] = co_await to.async_write_some(
-            asio::buffer(buffer.data() + bytes_written,
-                         bytes_read - bytes_written),
+            asio::buffer(write_data + bytes_written, write_len - bytes_written),
             asio::as_tuple(asio::use_awaitable));
         if (write_error) {
           Log::debug("[session: {}] | {} transfer write error: {}", session_id_,
@@ -427,9 +644,24 @@ private:
     }
   }
 
+  std::string relay_mode_to_string(RelayMode mode) {
+    switch (mode) {
+    case RelayMode::relay:
+      return "relay";
+    case RelayMode::client:
+      return "client";
+    case RelayMode::server:
+      return "server";
+    default:
+      // unreachable
+      std::abort();
+    }
+  }
+
 private:
   std::uint64_t session_id_;
   RelayConnectionOptions options_;
+  std::unique_ptr<StreamCipher> cipher_;
 };
 
 struct RelayServerOptions {
@@ -439,6 +671,8 @@ struct RelayServerOptions {
   std::uint32_t timeout;
   ViaType via_type;
   AddressType http_proxy_address;
+  RelayMode relay_mode;
+  std::string cipher_key;
 };
 
 class RelayServer {
@@ -455,6 +689,8 @@ public:
         .timeout = options_.timeout,
         .via_type = options_.via_type,
         .http_proxy_address = options_.http_proxy_address,
+        .relay_mode = options_.relay_mode,
+        .cipher_key = options_.cipher_key,
     };
     for (std::uint64_t session_id = 10000;; ++session_id) {
       auto client = co_await acceptor_.async_accept(asio::use_awaitable);
@@ -483,6 +719,8 @@ struct Args {
   AddressType http_proxy_address = {"", 0};
   LogLevel log_level = LogLevel::info;
   std::uint32_t num_threads = 4;
+  RelayMode relay_mode = RelayMode::relay;
+  std::string cipher_key;
 
   static void print_usage() {
 #ifdef _WIN32
@@ -508,6 +746,16 @@ struct Args {
         << "  --via [none | http_proxy]   Transfer via other proxy (default: "
            "none)\n"
         << "  --http_proxy string         HTTP-Proxy address (host:port)\n"
+        << "  --mode [relay | client | server]\n"
+        << "                              Relay mode (default: relay)\n"
+        << "                              - relay: passthrough without "
+           "encryption\n"
+        << "                              - client: encrypt uplink, decrypt "
+           "downlink\n"
+        << "                              - server: decrypt uplink, encrypt "
+           "downlink\n"
+        << "  --key string                Encryption key (required for "
+           "client/server mode)\n"
         << "  --log_level string [trace | debug | info | warn | error | "
            "disable] Log level (default: info)\n"
         << "  --threads number            Number of worker threads (default: "
@@ -657,6 +905,27 @@ struct Args {
         } catch (std::exception &) {
           invalid_param = true;
         }
+      } else if (arg == "--mode") {
+        if (++i >= argv.size()) {
+          invalid_param = true;
+          break;
+        }
+        if (argv[i] == "relay") {
+          args.relay_mode = RelayMode::relay;
+        } else if (argv[i] == "client") {
+          args.relay_mode = RelayMode::client;
+        } else if (argv[i] == "server") {
+          args.relay_mode = RelayMode::server;
+        } else {
+          invalid_param = true;
+          break;
+        }
+      } else if (arg == "--key") {
+        if (++i >= argv.size()) {
+          invalid_param = true;
+          break;
+        }
+        args.cipher_key = argv[i];
       } else {
         std::cerr << "Unknown argument: " << arg << std::endl;
         print_usage();
@@ -684,6 +953,13 @@ struct Args {
                   << std::endl;
         std::exit(EXIT_FAILURE);
       }
+    }
+
+    if (args.relay_mode != RelayMode::relay && args.cipher_key.empty()) {
+      std::cerr << "The argument '--key' is required when '--mode' is set to "
+                   "'client' or 'server'."
+                << std::endl;
+      std::exit(EXIT_FAILURE);
     }
     return args;
   }
@@ -713,6 +989,14 @@ struct Args {
     }
     std::cout << "Connection timeout: " << args.timeout << "\n";
     std::cout << "Worker threads: " << args.num_threads << "\n";
+    // Print encryption mode info
+    const char *mode_str = "relay";
+    if (args.relay_mode == RelayMode::client) {
+      mode_str = "client";
+    } else if (args.relay_mode == RelayMode::server) {
+      mode_str = "server";
+    }
+    std::cout << "Relay mode: " << mode_str << "\n";
   }
 };
 
@@ -734,6 +1018,8 @@ int main(int argc, char **argv) {
               .timeout = args.timeout,
               .via_type = args.via_type,
               .http_proxy_address = args.http_proxy_address,
+              .relay_mode = args.relay_mode,
+              .cipher_key = args.cipher_key,
           };
           RelayServer server(co_await asio::this_coro::executor, options);
           co_await server.listen();
