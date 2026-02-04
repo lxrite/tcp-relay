@@ -17,7 +17,6 @@
 #include <cstring>
 #include <format>
 #include <iostream>
-#include <memory>
 #include <mutex>
 #include <regex>
 #include <string>
@@ -32,7 +31,7 @@
 using namespace asio::experimental::awaitable_operators;
 using AddressType = std::pair<std::string, asio::ip::port_type>;
 
-constexpr char kAppVersionString[] = "1.1.0";
+constexpr char kAppVersionString[] = "1.1.1";
 
 constexpr std::uint32_t kResolveTimeout = 20;
 constexpr std::uint32_t kConnectTimeout = 20;
@@ -175,31 +174,6 @@ private:
   std::size_t decrypt_iv_offset_ = 0;
   bool encrypt_initialized_ = false;
   bool decrypt_initialized_ = false;
-};
-
-class Watchdog {
-public:
-  Watchdog(const asio::any_io_executor &executor) : timer_(executor) {}
-
-  virtual void expires_after(const std::chrono::seconds &interval) {
-    is_expired_ = false;
-    timer_.expires_after(interval);
-    timer_.async_wait([this](auto ec) {
-      if (!ec) {
-        is_expired_ = true;
-        cancel_.emit(asio::cancellation_type::terminal);
-      }
-    });
-  }
-
-  bool is_expired() const { return is_expired_; }
-
-  asio::cancellation_slot cancel_slot() noexcept { return cancel_.slot(); }
-
-private:
-  asio::steady_timer timer_;
-  asio::cancellation_signal cancel_;
-  bool is_expired_ = false;
 };
 
 class Deadline {
@@ -348,19 +322,22 @@ private:
     }
     auto executor = co_await asio::this_coro::executor;
     asio::ip::tcp::resolver resolver(executor);
-    Watchdog watchdog(executor);
-    watchdog.expires_after(std::chrono::seconds(kResolveTimeout));
+    asio::steady_timer timer(executor);
+    timer.expires_after(std::chrono::seconds(kResolveTimeout));
     Log::trace("[session: {}] | start resolving {}:{}", session_id_, host,
                port);
-    auto [ec, resolver_entries] = co_await resolver.async_resolve(
-        host, std::to_string(port),
-        asio::as_tuple(asio::bind_cancellation_slot(watchdog.cancel_slot(),
-                                                    asio::use_awaitable)));
-    if (watchdog.is_expired()) {
+    auto resolve_result =
+        co_await (resolver.async_resolve(host, std::to_string(port),
+                                         asio::as_tuple(asio::use_awaitable)) ||
+                  timer.async_wait(asio::as_tuple(asio::use_awaitable)));
+
+    if (resolve_result.index() == 1) {
       Log::error("[session: {}] | resolve {}:{} timeout", session_id_, host,
                  port);
       throw std::system_error(std::make_error_code(std::errc::timed_out));
     }
+
+    auto [ec, resolver_entries] = std::get<0>(resolve_result);
     if (ec) {
       Log::error("[session: {}] | resolve {}:{} error: {}", session_id_, host,
                  port, ec.message());
@@ -368,16 +345,28 @@ private:
     }
     Log::trace("[session: {}] | resolve {}:{} success", session_id_, host,
                port);
+
     asio::ip::tcp::socket server(executor);
     for (const auto resolver_entry : resolver_entries) {
-      watchdog.expires_after(std::chrono::seconds(kConnectTimeout));
+      timer.expires_after(std::chrono::seconds(kConnectTimeout));
       Log::trace("[session: {}] | start connecting {}:{}({})", session_id_,
                  host, port, endpoint_to_string(resolver_entry.endpoint()));
-      auto [ec] = co_await server.async_connect(
-          resolver_entry, asio::as_tuple(asio::bind_cancellation_slot(
-                              watchdog.cancel_slot(), asio::use_awaitable)));
+
+      auto connect_result =
+          co_await (server.async_connect(resolver_entry,
+                                         asio::as_tuple(asio::use_awaitable)) ||
+                    timer.async_wait(asio::as_tuple(asio::use_awaitable)));
+
+      if (connect_result.index() == 1) {
+        // Connect timeout, try next entry or fail
+        Log::trace("[session: {}] | connect to {}:{}({}) timeout", session_id_,
+                   host, port, endpoint_to_string(resolver_entry.endpoint()));
+        continue;
+      }
+
+      auto [ec] = std::get<0>(connect_result);
       if (ec) {
-        Log::trace("[session: {}] | connecte to {}:{}({}) error: {}",
+        Log::trace("[session: {}] | connect to {}:{}({}) error: {}",
                    session_id_, host, port,
                    endpoint_to_string(resolver_entry.endpoint()), ec.message());
       } else {
@@ -412,40 +401,46 @@ private:
     std::size_t request_header_size = request_header.size();
     std::size_t bytes_written = 0;
     auto executor = co_await asio::this_coro::executor;
-    Watchdog watchdog(executor);
+    asio::steady_timer timer(executor);
     while (bytes_written < request_header_size) {
-      watchdog.expires_after(std::chrono::seconds(kHttpProxyHandshakeTimeout));
-      auto [ec, bytes_transfered] = co_await server.async_write_some(
-          asio::buffer(request_header.data() + bytes_written,
-                       request_header_size - bytes_written),
-          asio::as_tuple(asio::bind_cancellation_slot(watchdog.cancel_slot(),
-                                                      asio::use_awaitable)));
-      if (watchdog.is_expired()) {
+      timer.expires_after(std::chrono::seconds(kHttpProxyHandshakeTimeout));
+      auto write_result =
+          co_await (server.async_write_some(
+                        asio::buffer(request_header.data() + bytes_written,
+                                     request_header_size - bytes_written),
+                        asio::as_tuple(asio::use_awaitable)) ||
+                    timer.async_wait(asio::as_tuple(asio::use_awaitable)));
+
+      if (write_result.index() == 1) {
         Log::error(
             "[session: {}] | http-proxy handshake write request header timeout",
             session_id_);
         throw std::system_error(std::make_error_code(std::errc::timed_out));
       }
+      auto [ec, bytes_transferred] = std::get<0>(write_result);
       if (ec) {
         Log::error("[session: {}] | http-proxy handshake write request header "
                    "error: {}",
                    session_id_, ec.message());
         throw std::system_error(ec);
       }
-      bytes_written += bytes_transfered;
+      bytes_written += bytes_transferred;
     }
     std::string response_header;
-    watchdog.expires_after(std::chrono::seconds(kHttpProxyHandshakeTimeout));
-    auto [ec, bytes_read] = co_await asio::async_read_until(
-        server, asio::dynamic_buffer(response_header, 2048), "\r\n\r\n",
-        asio::as_tuple(asio::bind_cancellation_slot(watchdog.cancel_slot(),
-                                                    asio::use_awaitable)));
-    if (watchdog.is_expired()) {
+    timer.expires_after(std::chrono::seconds(kHttpProxyHandshakeTimeout));
+    auto read_until_result =
+        co_await (asio::async_read_until(
+                      server, asio::dynamic_buffer(response_header, 2048),
+                      "\r\n\r\n", asio::as_tuple(asio::use_awaitable)) ||
+                  timer.async_wait(asio::as_tuple(asio::use_awaitable)));
+
+    if (read_until_result.index() == 1) {
       Log::error(
           "[session: {}] | http-proxy handshake read response header timeout",
           session_id_);
       throw std::system_error(std::make_error_code(std::errc::timed_out));
     }
+    auto [ec, bytes_read] = std::get<0>(read_until_result);
     if (ec) {
       Log::error(
           "[session: {}] | http-proxy handshake read response header error: {}",
