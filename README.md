@@ -45,7 +45,10 @@ options:
 ```
 
 ## Changelog
- 
+
+### 1.1.3
+- Fixed the listener silently stopping on accept failures
+
 ### 1.1.2
 - Bug fixes
 
