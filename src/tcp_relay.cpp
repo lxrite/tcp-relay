@@ -5,6 +5,8 @@
  *
  */
 
+#include <algorithm>
+#include <array>
 #include <asio/as_tuple.hpp>
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/detached.hpp>
@@ -14,14 +16,21 @@
 #include <asio/signal_set.hpp>
 #include <asio/steady_timer.hpp>
 #include <asio/strand.hpp>
+#include <atomic>
 #include <chrono>
+#include <csignal>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <format>
 #include <iostream>
 #include <mutex>
 #include <regex>
 #include <string>
+#include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <mbedtls/aes.h>
@@ -222,6 +231,11 @@ public:
   }
 
   template <typename... Args>
+  static void warn(std::format_string<Args...> fmt, Args &&...args) {
+    log(LogLevel::warn, fmt, std::forward<Args>(args)...);
+  }
+
+  template <typename... Args>
   static void error(std::format_string<Args...> fmt, Args &&...args) {
     log(LogLevel::error, fmt, std::forward<Args>(args)...);
   }
@@ -294,16 +308,19 @@ public:
   }
 
   asio::awaitable<void> relay(asio::ip::tcp::socket client) {
-    Log::info("[session: {}] | start connection from {}", session_id_,
-              endpoint_to_string(client.remote_endpoint()));
     try {
+      Log::info("[session: {}] | start connection from {}", session_id_,
+                endpoint_to_string(client.remote_endpoint()));
       auto executor = co_await asio::this_coro::executor;
       asio::ip::tcp::socket server = co_await connect_to_server();
       if (options_.via_type == ViaType::http_proxy) {
         co_await http_proxy_handshake(server);
       }
       co_await tunnel_transfer(client, server);
-    } catch (std::exception &e) {
+    } catch (const std::exception &e) {
+      Log::debug("[session: {}] | relay error: {}", session_id_, e.what());
+    } catch (...) {
+      Log::debug("[session: {}] | relay error", session_id_);
     }
     Log::info("[session: {}] | end connection", session_id_);
   }
@@ -688,21 +705,150 @@ public:
         .relay_mode = options_.relay_mode,
         .cipher_key = options_.cipher_key,
     };
-    for (std::uint64_t session_id = 10000;; ++session_id) {
-      auto client = co_await acceptor_.async_accept(asio::use_awaitable);
-      auto strand = asio::make_strand(executor);
-      asio::co_spawn(
-          strand,
-          [session_id, conn_options,
-           client = std::move(client)]() mutable -> asio::awaitable<void> {
-            RelayConnection conn(session_id, conn_options);
-            co_await conn.relay(std::move(client));
-          },
-          asio::detached);
+    constexpr auto kMinBackoff = std::chrono::milliseconds{1};
+    constexpr auto kMaxBackoff = std::chrono::milliseconds{1000};
+    constexpr auto kMaxTransientBackoff = std::chrono::milliseconds{16};
+    constexpr auto kLogInterval = std::chrono::seconds{1};
+    // A run of per-connection errors only counts as a burst while consecutive
+    // errors keep arriving within this window.
+    constexpr auto kTransientWindow = std::chrono::seconds{1};
+    constexpr std::uint32_t kMaxConsecutiveTransient = 100;
+    asio::steady_timer backoff_timer(executor);
+    std::chrono::milliseconds backoff = kMinBackoff;
+    std::chrono::milliseconds transient_backoff = kMinBackoff;
+    auto last_warn_log = std::chrono::steady_clock::now() - kLogInterval;
+    auto last_error_log = last_warn_log;
+    auto last_transient = last_warn_log;
+    std::uint32_t consecutive_transient = 0;
+    std::uint64_t session_id = 10000;
+    for (;;) {
+      auto [ec, client] =
+          co_await acceptor_.async_accept(asio::as_tuple(asio::use_awaitable));
+      if (!ec) {
+        auto strand = asio::make_strand(executor);
+        asio::co_spawn(
+            strand,
+            [session_id, conn_options,
+             client = std::move(client)]() mutable -> asio::awaitable<void> {
+              RelayConnection conn(session_id, conn_options);
+              co_await conn.relay(std::move(client));
+            },
+            [session_id](std::exception_ptr e) {
+              if (!e) {
+                return;
+              }
+              try {
+                std::rethrow_exception(e);
+              } catch (const std::exception &ex) {
+                Log::error("[session: {}] | unexpected error: {}", session_id,
+                           ex.what());
+              } catch (...) {
+                Log::error("[session: {}] | unexpected error", session_id);
+              }
+            });
+        ++session_id;
+        backoff = kMinBackoff;
+        transient_backoff = kMinBackoff;
+        consecutive_transient = 0;
+        continue;
+      }
+      AcceptErrorKind kind = classify_accept_error(ec);
+      if (kind == AcceptErrorKind::shutdown) {
+        // A cancelled acceptor is an intentional shutdown, not a failure.
+        // Return normally so main exits with a success code.
+        Log::info("accept cancelled; stopping listener");
+        co_return;
+      }
+      if (kind == AcceptErrorKind::fatal) {
+        // Let the co_spawn completion handler report the error and shut down.
+        throw std::system_error(ec, "accept");
+      }
+      auto now = std::chrono::steady_clock::now();
+      if (kind == AcceptErrorKind::transient) {
+        // Isolated errors spread over time must not accumulate into a burst.
+        if (now - last_transient >= kTransientWindow) {
+          consecutive_transient = 0;
+          transient_backoff = kMinBackoff;
+        }
+        last_transient = now;
+        if (consecutive_transient < kMaxConsecutiveTransient) {
+          ++consecutive_transient;
+        }
+        if (consecutive_transient < kMaxConsecutiveTransient) {
+          // One bad connection costs nothing to drop, so retry immediately.
+          if (now - last_warn_log >= kLogInterval) {
+            Log::warn("accept error: {}; dropping bad connection",
+                      ec.message());
+            last_warn_log = now;
+          }
+          continue;
+        }
+      } else {
+        // Any other error breaks the run of per-connection errors.
+        consecutive_transient = 0;
+        transient_backoff = kMinBackoff;
+      }
+      // A tripped breaker uses its own small cap, so healthy connections in the
+      // backlog never inherit the backoff meant for resource exhaustion.
+      auto delay =
+          kind == AcceptErrorKind::transient ? transient_backoff : backoff;
+      if (now - last_error_log >= kLogInterval) {
+        Log::error("accept error: {}; retrying in {}ms", ec.message(),
+                   delay.count());
+        last_error_log = now;
+      }
+      backoff_timer.expires_after(delay);
+      auto [wait_ec] = co_await backoff_timer.async_wait(
+          asio::as_tuple(asio::use_awaitable));
+      if (wait_ec == asio::error::operation_aborted) {
+        co_return;
+      }
+      if (wait_ec) {
+        throw std::system_error(wait_ec, "accept backoff");
+      }
+      if (kind == AcceptErrorKind::transient) {
+        transient_backoff =
+            std::min(transient_backoff * 2, kMaxTransientBackoff);
+      } else {
+        backoff = std::min(backoff * 2, kMaxBackoff);
+      }
     }
   }
 
 private:
+  enum class AcceptErrorKind {
+    transient, // caused by a single connection
+    exhausted, // anything else recoverable; needs a growing backoff
+    shutdown,  // the accept operation was cancelled
+    fatal,     // the listening socket itself is unusable
+  };
+
+  static AcceptErrorKind classify_accept_error(const std::error_code &ec) {
+    if (ec == asio::error::operation_aborted) {
+      return AcceptErrorKind::shutdown;
+    }
+    // Per-connection failures: the acceptor is healthy, so drop this client.
+    if (ec == asio::error::interrupted || ec == asio::error::try_again ||
+        ec == asio::error::would_block ||
+        ec == asio::error::connection_aborted ||
+        ec == asio::error::connection_reset ||
+        ec == asio::error::connection_refused || ec == asio::error::timed_out ||
+        ec == asio::error::network_reset ||
+        ec == asio::error::host_unreachable ||
+        ec == asio::error::network_unreachable) {
+      return AcceptErrorKind::transient;
+    }
+    // Only these mean the listening socket itself cannot be used. Everything
+    // else -- resource exhaustion, ENFILE, unfamiliar platform errors -- gets
+    // a bounded backoff instead of taking the whole process down.
+    if (ec == asio::error::bad_descriptor ||
+        ec == asio::error::invalid_argument || ec == asio::error::not_socket ||
+        ec == asio::error::operation_not_supported) {
+      return AcceptErrorKind::fatal;
+    }
+    return AcceptErrorKind::exhausted;
+  }
+
   asio::ip::tcp::acceptor acceptor_;
   RelayServerOptions options_;
 };
@@ -1001,6 +1147,7 @@ int main(int argc, char **argv) {
   auto args = Args::parse_args(argc, argv);
   Args::print_args(args);
   Log::set_log_level(args.log_level);
+  std::atomic<int> exit_code{EXIT_SUCCESS};
   try {
     asio::io_context io_context(args.num_threads);
     asio::signal_set signals(io_context, SIGINT, SIGTERM);
@@ -1021,18 +1168,63 @@ int main(int argc, char **argv) {
           RelayServer server(co_await asio::this_coro::executor, options);
           co_await server.listen();
         },
-        asio::detached);
+        [&io_context, &exit_code](std::exception_ptr e) {
+          if (!e) {
+            // listen() only returns on a deliberate shutdown. Stop the
+            // io_context too, otherwise signal_set keeps the process alive
+            // with no listener running.
+            io_context.stop();
+            return;
+          }
+          // Fatal errors must be visible even with --log_level disable.
+          try {
+            std::rethrow_exception(e);
+          } catch (const std::exception &ex) {
+            std::cerr << std::format("fatal error in relay server: {}\n",
+                                     ex.what());
+          } catch (...) {
+            std::cerr << "fatal error in relay server: unknown exception\n";
+          }
+          exit_code.store(EXIT_FAILURE, std::memory_order_relaxed);
+          io_context.stop();
+        });
+    auto run = [&]() {
+      try {
+        io_context.run();
+      } catch (const std::exception &e) {
+        std::cerr << std::format("unexpected error in io thread: {}\n",
+                                 e.what());
+        exit_code.store(EXIT_FAILURE, std::memory_order_relaxed);
+        io_context.stop();
+      } catch (...) {
+        std::cerr << "unexpected error in io thread\n";
+        exit_code.store(EXIT_FAILURE, std::memory_order_relaxed);
+        io_context.stop();
+      }
+    };
     std::vector<std::thread> threads;
     threads.reserve(args.num_threads - 1);
-    for (std::uint32_t i = 1; i < args.num_threads; ++i) {
-      threads.emplace_back([&io_context]() { io_context.run(); });
+    try {
+      for (std::uint32_t i = 1; i < args.num_threads; ++i) {
+        threads.emplace_back(run);
+      }
+    } catch (...) {
+      io_context.stop();
+      for (auto &t : threads) {
+        t.join();
+      }
+      throw;
     }
-    io_context.run();
+    run();
     for (auto &t : threads) {
       t.join();
     }
-  } catch (std::exception &e) {
-    std::printf("Exception: %s\n", e.what());
+  } catch (const std::exception &e) {
+    std::cerr << std::format("fatal error: {}\n", e.what());
+    return EXIT_FAILURE;
+  } catch (...) {
+    std::cerr << "fatal error: unknown exception\n";
+    return EXIT_FAILURE;
   }
-  return 0;
+  return exit_code.load(std::memory_order_relaxed);
 }

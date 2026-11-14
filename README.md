@@ -6,8 +6,8 @@ A high-performance and easy-to-use TCP-Relay write in C++20 based on [ASIO](http
 # Getting Started
 ## Build from source
 This project relies on some C++20 features. The following compilers and their respective versions are supported:
-- GCC >= 12.0
-- Clang >= 14.0
+- GCC >= 14.0 (`std::format` on `std::chrono::zoned_time` requires libstdc++ 14+)
+- Clang >= 14.0 with libstdc++ >= 14
 - Microsoft Visual Studio (MSVC) >= 2019
 
 ``` bash
